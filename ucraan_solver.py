@@ -137,8 +137,10 @@ class Fleet:
 # handover risk that dips during periodic handover windows (7.2, satellite).
 # ----------------------------------------------------------------------------
 def sat_access_prob(t, base=0.97, period=30.0, dip=0.25, width=5.0):
-    phase = t % period
-    if phase < width:                      # handover window
+    # The sim schedules its FIRST outage at t = period (not t = 0), then every
+    # `period` seconds the satellite is down for `width` seconds. Mirror that
+    # exactly so UCRAAN's risk model matches the reality ns-3 enforces.
+    if t >= period and (t % period) < width:   # inside a handover window
         return base - dip
     return base
 
@@ -175,6 +177,13 @@ def main():
                     help="seconds between satellite handover windows (large=calm)")
     ap.add_argument("--ho-dip", type=float, default=0.25,
                     help="satellite accessibility drop during a handover window")
+    ap.add_argument("--ho-width", type=float, default=5.0,
+                    help="handover outage duration (s); MUST match the sim's "
+                         "--handoverDur")
+    ap.add_argument("--t-max", type=float, default=0.0,
+                    help="stop generating route slots after this time (s); "
+                         "0 = full mobility span. Set to simTime to avoid "
+                         "wasting minutes computing routes ns-3 never uses")
     ap.add_argument("--mode", choices=["ucraan", "delay"], default="ucraan",
                     help="ucraan=uncertainty-aware chance-constrained; "
                          "delay=delay-optimal shortest path on point-estimate state")
@@ -195,6 +204,8 @@ def main():
     n = fleet.n
     dst = args.dst if args.dst >= 0 else n - 1
     src = args.src
+    if not (0 <= src < n and 0 <= dst < n) or src == dst:
+        raise SystemExit(f"bad src/dst ({src},{dst}) for fleet of {n} aircraft")
     lb = LinkBudget(fc_hz=args.carrier, ptx_dbm=46, gain_dbi=10, noise_dbm=-90)
 
     # A mesh link "survives" exactly when the two planes stay within mesh range
@@ -214,7 +225,9 @@ def main():
     last_seen = {}       # (a,b) -> float (timestamp of last update)
 
     rows = []
-    slots = np.arange(fleet.t_min, fleet.t_max, args.slot)
+    t_end = fleet.t_max if args.t_max <= 0 else min(fleet.t_max,
+                                                    fleet.t_min + args.t_max)
+    slots = np.arange(fleet.t_min, t_end, args.slot)
 
     for t in slots:
         # geometry at this slot
@@ -291,7 +304,8 @@ def main():
                         G.add_edge(a, b, tier="mesh", p=1.0, delay=delay_ms, weight=delay_ms)
 
                 # satellite bridge edge (5G NTN), available to all pairs
-                p_sat = sat_access_prob(t, period=args.ho_period, dip=args.ho_dip)
+                p_sat = sat_access_prob(t, period=args.ho_period,
+                                        dip=args.ho_dip, width=args.ho_width)
                 if args.mode == "ucraan":
                     cost_sat = sat_delay_ms + args.risk_weight * (-math.log(max(p_sat, 1e-6)))
                 else:

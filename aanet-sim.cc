@@ -249,9 +249,9 @@ main(int argc, char* argv[])
     double ntnRange = 1500000.0;  // aircraft<->satellite reach (m)
     double satAlt = 600000.0;     // LEO altitude (m) -> sets NTN latency
     double geoScale = 1.0;        // shrink world so ns-3 Wi-Fi can ACK (see note)
-    std::string appRate = "10Mbps";
-    uint32_t srcIdx = 0;
-    uint32_t dstIdx = 0; // 0 => last aircraft
+    std::string appRate = "2Mbps";
+    int srcIdx = 0;
+    int dstIdx = -1; // -1 => last aircraft (0 is a valid destination!)
     double simTime = 0.0;
 
     CommandLine cmd;
@@ -272,7 +272,7 @@ main(int argc, char* argv[])
     cmd.AddValue("sampleInt", "Seconds between next-hop samples for route metrics", sampleInt);
     cmd.AddValue("appRate", "Offered traffic rate", appRate);
     cmd.AddValue("src", "Source aircraft index", srcIdx);
-    cmd.AddValue("dst", "Destination aircraft index (0=last)", dstIdx);
+    cmd.AddValue("dst", "Destination aircraft index (-1=last)", dstIdx);
     cmd.AddValue("simTime", "Seconds (0=auto)", simTime);
     cmd.Parse(argc, argv);
 
@@ -296,8 +296,11 @@ main(int argc, char* argv[])
     NS_ABORT_MSG_IF(nAir < 2, "Need >= 2 aircraft in mobility.csv");
     if (simTime <= 0.0)
         simTime = trajMax + 1.0;
-    if (dstIdx == 0)
-        dstIdx = nAir - 1;
+    if (dstIdx < 0)
+        dstIdx = (int)nAir - 1;
+    NS_ABORT_MSG_IF(srcIdx < 0 || srcIdx >= (int)nAir || dstIdx >= (int)nAir,
+                    "src/dst out of range (nAir=" << nAir << ")");
+    NS_ABORT_MSG_IF(srcIdx == dstIdx, "src == dst");
 
     NodeContainer aircraft;
     aircraft.Create(nAir);     // middle tier: the AANET mesh
@@ -444,21 +447,24 @@ main(int argc, char* argv[])
         for (auto& kv : g_schedule)
             Simulator::Schedule(Seconds(kv.first), &ApplyRoutes, kv.first);
         NS_LOG_UNCOND("UCRAAN mode: " << g_schedule.size() << " route slots loaded");
+        if (g_schedule.empty())
+            NS_LOG_UNCOND("WARNING: routes file parsed to ZERO entries -- "
+                          "the routed run will deliver nothing. Check the solver output.");
     }
 
     // ---- STEP F: UDP flow, source aircraft -> destination aircraft ---------
     uint16_t port = 9;
-    Ipv4Address dstAddr = meshIf.GetAddress(dstIdx);
+    Ipv4Address dstAddr = meshIf.GetAddress((uint32_t)dstIdx);
     NS_LOG_UNCOND("source -> " << dstAddr << " (dst mesh IP)");
     OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(dstAddr, port));
     onoff.SetConstantRate(DataRate(appRate), 1024);
     onoff.SetAttribute("StartTime", TimeValue(Seconds(2.0)));
     onoff.SetAttribute("StopTime", TimeValue(Seconds(simTime - 1.0)));
-    onoff.Install(aircraft.Get(srcIdx));
+    onoff.Install(aircraft.Get((uint32_t)srcIdx));
 
     PacketSinkHelper sink("ns3::UdpSocketFactory",
                           InetSocketAddress(Ipv4Address::GetAny(), port));
-    ApplicationContainer dstApp = sink.Install(aircraft.Get(dstIdx));
+    ApplicationContainer dstApp = sink.Install(aircraft.Get((uint32_t)dstIdx));
     dstApp.Start(Seconds(0.0));
     dstApp.Stop(Seconds(simTime));
 
@@ -468,9 +474,9 @@ main(int argc, char* argv[])
 
     // sample the source's next hop toward dst every sampleInt seconds, so we can
     // derive route lifetime + reroute count for ANY protocol from ns-3 itself.
-    g_srcNode = aircraft.Get(srcIdx);
+    g_srcNode = aircraft.Get((uint32_t)srcIdx);
     g_dstAddr = dstAddr;
-    g_srcAddr = meshIf.GetAddress(srcIdx);
+    g_srcAddr = meshIf.GetAddress((uint32_t)srcIdx);
     for (double ts = 2.0; ts < simTime; ts += sampleInt)
         Simulator::Schedule(Seconds(ts), &SampleNextHop);
 
@@ -481,7 +487,7 @@ main(int argc, char* argv[])
         if (tDump > 60.0)
             tDump = 60.0;
         Ptr<OutputStreamWrapper> dbg = Create<OutputStreamWrapper>(&std::cout);
-        Ipv4RoutingHelper::PrintRoutingTableAt(Seconds(tDump), aircraft.Get(srcIdx), dbg);
+        Ipv4RoutingHelper::PrintRoutingTableAt(Seconds(tDump), aircraft.Get((uint32_t)srcIdx), dbg);
     }
 
     Simulator::Stop(Seconds(simTime));
@@ -491,14 +497,15 @@ main(int argc, char* argv[])
     monitor->CheckForLostPackets();
     Ptr<Ipv4FlowClassifier> classifier =
         DynamicCast<Ipv4FlowClassifier>(fm.GetClassifier());
-    uint64_t tx = 0, r x = 0, lost = 0, rxBytes = 0, ctrlPkts = 0;
+    uint64_t tx = 0, rx = 0, lost = 0, rxBytes = 0, ctrlPkts = 0;
     double delaySum = 0.0, jitterSum = 0.0;
     for (const auto& kv : monitor->GetFlowStats())
     {
         Ipv4FlowClassifier::FiveTuple ft = classifier->FindFlow(kv.first);
         if (ft.destinationPort == 698) // OLSR control traffic
         {
-            continue; // don't count control as data
+            ctrlPkts += kv.second.txPackets; // measure signalling overhead
+            continue;                        // ...but don't count it as data
         }
         tx += kv.second.txPackets;
         rx += kv.second.rxPackets;
@@ -542,6 +549,23 @@ main(int argc, char* argv[])
                   << "  jitter=" << jitterMs << "  throughput=" << thrKbps
                   << "  lost=" << lost << "  routeLife=" << routeLifeS
                   << "  reroutePerS=" << reroutePerS << "  ctrlPps=" << ctrlPps);
+
+    // also append to the results CSV so data survives even if stdout parsing fails
+    if (!outFile.empty() && outFile != "/dev/null")
+    {
+        bool fresh = !std::ifstream(outFile.c_str()).good();
+        std::ofstream out(outFile.c_str(), std::ios::app);
+        if (out.is_open())
+        {
+            if (fresh)
+                out << "protocol,tx,rx,pdr,mean_delay_ms,jitter_ms,throughput_kbps,"
+                       "lost,route_life_s,reroute_per_s,ctrl_pps\n";
+            out << (routesFile.empty() ? "olsr" : "routed") << ',' << tx << ',' << rx
+                << ',' << pdr << ',' << meanDelayMs << ',' << jitterMs << ','
+                << thrKbps << ',' << lost << ',' << routeLifeS << ','
+                << reroutePerS << ',' << ctrlPps << '\n';
+        }
+    }
 
     Simulator::Destroy();
     return 0;

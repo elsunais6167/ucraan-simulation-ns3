@@ -98,37 +98,50 @@ def find_pair(n, tr, tmin, tmax, mesh_range, slot=5.0):
                             edge[(a, b)] += 1
     if not seen:
         raise SystemExit("No co-present pairs found; check mobility / --mesh-range.")
-    # rank by fraction of co-present time the path bottleneck hugs the edge
-    best = None
+    # Rank pairs by (multi-hop?, edge fraction, median hops). A 1-hop pair gives
+    # the protocols nothing to decide, so multi-hop is a hard preference; among
+    # multi-hop pairs prefer the one whose bottleneck hugs the range edge most
+    # (that's where sensing noise separates the protocols), tie-broken by hops.
+    cand = []
     for pair, s in seen.items():
         if s < 0.5 * len(slots):
             continue
         ef = edge[pair] / s
-        if best is None or ef > best[0]:
-            best = (ef, pair, s)
-    if best is None or best[0] == 0:
-        # no edge-hugging route -> fall back to most co-present pair
+        mh = float(np.median(hopsum[pair])) if hopsum[pair] else 1.0
+        cand.append((mh >= 2, ef, mh, pair))
+    if not cand:  # nothing co-present half the time -> take the most co-present
         pair = max(seen, key=lambda p: seen[p])
         mh = float(np.median(hopsum[pair])) if hopsum[pair] else 1.0
         return pair[0], pair[1], 0.0, mh
-    ef, pair, s = best
-    mh = float(np.median(hopsum[pair])) if hopsum[pair] else 1.0
+    multi, ef, mh, pair = max(cand)
     return pair[0], pair[1], ef, mh
 
 
 # ---- subprocess wrappers ---------------------------------------------------
-def gen_routes(solver, mobility, src, dst, se, ho, mode, mesh_range, out):
+def gen_routes(solver, mobility, src, dst, se, ho, ho_dur, mode, mesh_range,
+               t_max, out):
     cmd = (f"python3 {solver} --mobility {mobility} --src {src} --dst {dst} "
-           f"--sensing-error {se} --ho-period {ho} --mode {mode} "
-           f"--mesh-range {mesh_range} --out {out}")
-    subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+           f"--sensing-error {se} --ho-period {ho} --ho-width {ho_dur} "
+           f"--mode {mode} --mesh-range {mesh_range} --t-max {t_max} --out {out}")
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"  !! solver failed ({mode} se={se} ho={ho}):\n{p.stderr[-2000:]}")
+        return False
+    return True
 
 
 def run_sim(ns3, binary, args_str, timeout):
     cmd = f'{ns3} run "{binary} {args_str}"'
-    p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"  !! sim timed out after {timeout}s: {cmd}")
+        return None
     m = RESULT_RE.search(p.stdout + p.stderr)
     if not m:
+        tail = (p.stdout + p.stderr)[-2000:]
+        print(f"  !! no RESULT line from sim (rc={p.returncode}). Output tail:\n{tail}")
         return None
     return dict(tx=int(m.group(1)), rx=int(m.group(2)), pdr=float(m.group(3)),
                 delay=float(m.group(4)), jitter=float(m.group(5)),
@@ -146,8 +159,17 @@ def main():
     ap.add_argument("--geoScale", type=float, default=0.0005)
     ap.add_argument("--simTime", type=float, default=120)
     ap.add_argument("--mesh-range", type=float, default=200000)
-    ap.add_argument("--sensing", type=float, nargs="+", default=[5.0, 6.0, 8.0, 11.0])
-    ap.add_argument("--ho-period", type=float, nargs="+", default=[1, 0.5, 0.2, 0.1])
+    ap.add_argument("--sensing", type=float, nargs="+",
+                    default=[0.2, 0.5, 1.0, 2.0, 4.0])
+    ap.add_argument("--ho-period", type=float, nargs="+",
+                    default=[1000.0, 60.0, 30.0, 15.0])
+    ap.add_argument("--ho-dur", type=float, default=5.0,
+                    help="seconds the satellite is down per handover; passed to "
+                         "BOTH the sim (--handoverDur) and the solver (--ho-width) "
+                         "so the solver's risk model matches reality")
+    ap.add_argument("--app-rate", default="2Mbps",
+                    help="offered UDP load; keep well under multi-hop 802.11a "
+                         "capacity so delay/PDR reflect routing, not congestion")
     ap.add_argument("--src", type=int, default=-1, help="-1 = auto-find")
     ap.add_argument("--dst", type=int, default=-1)
     ap.add_argument("--timeout", type=int, default=1800)
@@ -170,6 +192,7 @@ def main():
 
     common = (f"--mobility={args.mobility} --geoScale={args.geoScale} "
               f"--simTime={args.simTime} --meshRange={args.mesh_range} "
+              f"--handoverDur={args.ho_dur} --appRate={args.app_rate} "
               f"--src={src} --dst={dst} --output=/dev/null")
     tmp = tempfile.mkdtemp()
     rows = []
@@ -198,8 +221,10 @@ def main():
             record("olsr", se, ho, r_olsr)
             for mode, name in [("delay", "delay_opt"), ("ucraan", "ucraan")]:
                 rf = os.path.join(tmp, f"r_{name}_{se}_{ho}.csv")
-                gen_routes(args.solver, args.mobility, src, dst, se, ho, mode,
-                           args.mesh_range, rf)
+                if not gen_routes(args.solver, args.mobility, src, dst, se, ho,
+                                  args.ho_dur, mode, args.mesh_range,
+                                  args.simTime, rf):
+                    continue
                 r = run_sim(args.ns3, args.binary,
                             f"{common} --handoverPeriod={ho} --routes={rf}", args.timeout)
                 record(name, se, ho, r)

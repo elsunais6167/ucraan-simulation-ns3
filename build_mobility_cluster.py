@@ -66,8 +66,11 @@ def main():
     df["time"] = pd.to_numeric(df["time"], errors="coerce")
     df = df.dropna(subset=["time"])
 
-    # 1) busiest time window: bucket time, take the bucket with most aircraft
-    df["bucket"] = (df["time"] // args.window) * args.window
+    # 1) busiest time window: bucket time RELATIVE TO THE DATASET START (an
+    #    epoch-aligned bucket can straddle the data boundary and yield a
+    #    partial window), take the bucket with most aircraft
+    t0 = df["time"].min()
+    df["bucket"] = ((df["time"] - t0) // args.window) * args.window + t0
     best = df.groupby("bucket")["icao24"].nunique().idxmax()
     win = df[df["bucket"] == best].copy()
     print(f"window @ t={best:.0f}  aircraft in window: {win['icao24'].nunique()}")
